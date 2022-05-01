@@ -1,7 +1,7 @@
 /* 
  * tsh - A tiny shell program with job control
  * 
- * <Put your name and login ID here>
+ * Ryan Brooks, U1115093
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -94,6 +94,9 @@ void waitfg(pid_t pid);
 void sigchld_handler(int sig);
 void sigtstp_handler(int sig);
 void sigint_handler(int sig);
+
+/* My Funcions */
+struct job_t *getfgjob(struct job_t *jobs);
 
 /* Here are helper routines that we've provided for you */
 int parseline(const char *cmdline, char **argv, int cmdnum); 
@@ -219,6 +222,57 @@ void eval(char *cmdline)
   if(cmd2 != NULL)
     parseline(cmd2, argv2, 2);
 
+  //if this is not a builtin process
+  if(!builtin_cmd(argv1)){
+    //initialize child values
+    pid_t pid = 0;
+    pid_t pid_2 = 0;
+    sigset_t sigs;
+    int fds[2];
+    pipe(fds);
+    sigemptyset(&sigs);
+    sigaddset(&sigs,SIGCHLD);
+    sigprocmask(SIG_BLOCK, &sigs, NULL);
+    //CHILD 1 CODE
+    if(0 == (pid = fork())){
+      setpgid(0,0);
+      //if the cmdline contains a pipe
+      sigprocmask(SIG_UNBLOCK, &sigs, NULL);
+      if(cmd2!=NULL){
+	dup2(fds[1], 1);
+	close(fds[1]);
+      }
+      execve(argv1[0], argv1, environ);
+      printf("%s: Command not found\n", argv1[0]);
+      exit(0);
+    }
+    //piped CHILD 2 CODE
+    if(cmd2!=NULL){
+      close(fds[1]);
+      if(0 == (pid_2 = fork())){
+	setpgid(0,0);
+	sigprocmask(SIG_UNBLOCK, &sigs, NULL);
+	
+        dup2(fds[0] ,0);
+        execve(argv2[0],argv2, environ);
+        printf("%s: Command not found\n", argv2[0]);
+        exit(0);
+      }
+    }
+    //PARENT CODE (CHILD 1)
+    close(fds[0]);
+    //add to jobs and unset mask
+    addjob(jobs,pid,bg+1,cmdline);
+    sigprocmask(SIG_UNBLOCK, &sigs, NULL);
+    //background 
+    if(bg){
+      printf("[%d] (%ld) %s",pid2jid(pid),(long)pid,cmdline);
+    }
+    //foreground, wait for child
+    else{
+       waitfg(pid);
+    }
+  }
   // TODO: Execute the command(s)
   //       If cmd2 is NULL, then there is only one command
 
@@ -299,12 +353,13 @@ int parseline(const char *cmdline, char **argv, int cmdnum)
 int builtin_cmd(char **argv) 
 {
   char *cmd = argv[0];
-
-  // TODO: Implement "quit" and "jobs" commands
-  //       "bg" and "fg" commands are partially handled here,
-  //       but you need to implement the do_bg and do_fg functions.
-
-
+  if(!strcmp(cmd, "quit")){
+    exit(0);
+  }
+  if(!strcmp(cmd, "jobs")){
+    listjobs(jobs);
+    return 1;
+  }
   if (!strcmp(cmd, "bg") || !strcmp(cmd, "fg")) { /* bg and fg commands */
       
     int jid;
@@ -342,6 +397,19 @@ int builtin_cmd(char **argv)
  */
 void do_bg(int jid) 
 {
+  struct job_t *job = getjobjid(jobs,jid);
+  //valid job
+  if(job!=NULL){
+    pid_t pid = job->pid;
+    //Send SIGCONT
+    kill(-pid,SIGCONT);
+    //job is now in the background
+    job->state=BG;
+    printf("[%d] (%ld) %s",jid,pid,job->cmdline);
+  }
+  else{
+    printf("%%%d: No such job\n",jid);
+  }
   return;
 }
 
@@ -349,7 +417,24 @@ void do_bg(int jid)
  * do_fg - Execute the builtin fg command
  */
 void do_fg(int jid) 
-{
+{ 
+  struct job_t *job = getjobjid(jobs,jid);
+  //valid job
+  if(job!=NULL){
+    pid_t pid = job->pid;
+    //Send SIGCONT
+    kill(-pid,SIGCONT);
+    //job is now in the foreground so we need to wair for it
+    job->state=FG;
+    waitfg(pid);
+    //if the job has completed delete it
+    if(job->state!=ST){
+      deletejob(jobs,pid);
+    }
+  }
+  else{
+    printf("%%%d: No such job\n", jid);
+  }
   return;
 }
 
@@ -358,6 +443,16 @@ void do_fg(int jid)
  */
 void waitfg(pid_t pid)
 {
+  struct job_t* job;
+  sigset_t emptymask;
+  sigemptyset(&emptymask);
+  while(1){
+    if(((job = getfgjob(jobs))!=NULL)&&(pid == job->pid)){
+      sigsuspend(&emptymask);
+      continue;
+    }
+    break;
+  }
   return;
 }
 
@@ -373,7 +468,51 @@ void waitfg(pid_t pid)
  *     currently running children to terminate.  
  */
 void sigchld_handler(int sig) 
-{
+{ int save_errno = errno;
+  int stat;
+  pid_t pid;
+  //check exit status of children if located
+  while(0<(pid=waitpid(-1,&stat,WNOHANG | WUNTRACED))){
+    struct job_t *job = getjobpid(jobs,pid);
+
+    //child exited from signal
+    if(WIFSIGNALED(stat)){
+      //output async-signal-safe message and delete from jobs
+      int num = WTERMSIG(stat);
+      sio_puts("Job [");
+      sio_putl((long) job->jid);
+      sio_puts("] (");
+      sio_putl((long) pid);
+      sio_puts(") terminated by signal ");
+      sio_putl((long) num);
+      sio_puts("\n");
+
+      deletejob(jobs, pid);
+    }
+
+    //child exited normally
+    else if(WIFEXITED(stat)){
+      //print message and delete from jobs
+      
+      deletejob(jobs, pid);
+    }
+
+    //child is stopped
+    else if(WIFSTOPPED(stat)){
+      //output async-signal-safe message and put job into stopped state
+      int num = WSTOPSIG(stat);
+      sio_puts("Job [");
+      sio_putl((long) job->jid);
+      sio_puts("] (");
+      sio_putl((long) pid);
+      sio_puts(") stopped by signal ");
+      sio_putl((long) num);
+      sio_puts("\n");
+
+      job->state = ST;
+    }
+  }
+  errno = save_errno;
   return;
 }
 
@@ -384,6 +523,14 @@ void sigchld_handler(int sig)
  */
 void sigint_handler(int sig) 
 {
+  int save_errno = errno;
+  struct job_t *job;
+  //attempt to get a foreground job
+  if((job=getfgjob(jobs))!=NULL){
+    //send the signal to foreground
+    kill(-(job->pid),sig);
+  }
+  errno = save_errno;
   return;
 }
 
@@ -394,6 +541,14 @@ void sigint_handler(int sig)
  */
 void sigtstp_handler(int sig) 
 {
+  int save_errno = errno;
+  struct job_t *job;
+  //attempt to get a foreground job
+  if((job=getfgjob(jobs))!=NULL){
+    //send the signal to foreground
+    kill(-(job->pid),sig);
+  }
+  errno = save_errno;
   return;
 }
 
@@ -474,6 +629,15 @@ int deletejob(struct job_t *jobs, pid_t pid)
     }
   }
   return 0;
+}
+struct job_t *getfgjob(struct job_t *jobs){
+  int i=0;
+  for(i; i<MAXJOBS; i++){
+    if (FG==jobs[i].state){
+      return &jobs[i];
+    }
+  }
+  return NULL;
 }
 
 
